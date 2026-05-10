@@ -1,0 +1,14 @@
+build/
+bin/
+*.o
+*.a
+*.so
+*.out
+*.exe
+*.log
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+.cache/
