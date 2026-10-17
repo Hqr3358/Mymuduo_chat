@@ -5,10 +5,12 @@
 #include <mutex>
 #include <set>
 
-// Redis 发布订阅封装：
-// - publish_context_ 被多个 muduo worker 线程并发使用，加锁串行化 redisCommand
-// - subscribe_context_ 只在独立接收线程里使用
-// - 订阅线程断连后自动重连，并把之前订阅过的 channel 重新订阅一遍
+/**
+ * @brief Redis 发布订阅封装
+ * @details publish_context_ 被多个 muduo worker 线程并发使用，加锁串行化；
+ *          subscribe_context_ 只在独立接收线程里使用；
+ *          订阅线程断连后自动重连，并把之前订阅过的 channel 重新订阅一遍
+ */
 class Redis
 {
 public:

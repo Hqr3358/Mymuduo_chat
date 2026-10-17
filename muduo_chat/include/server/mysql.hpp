@@ -11,10 +11,10 @@ class Mysql
 public:
     Mysql();                  // 构造：从连接池取连接
     ~Mysql();                 // 析构：归还连接
-    MYSQL* getmy_();
-    MYSQL_RES* query(std::string sql);
-    bool insert(std::string sql);
-    void update(std::string sql);
+    MYSQL* getmy_();                              // 获取底层 MYSQL* 句柄
+    MYSQL_RES* query(std::string sql);            // 查询，返回结果集（由析构统一释放）
+    bool insert(std::string sql);                 // insert，成功返回 true
+    void update(std::string sql);                 // update/delete，无返回值
 private:
     MYSQL* my_;
     MYSQL_RES* res_;
