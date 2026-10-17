@@ -1,15 +1,14 @@
 #pragma once
-enum publicmsg
-{
-    REGT=1,//注册 1
-    LOGTO,//登录 2
-    CHAT,//聊天 3
-    ADDFRIEND,//加好友 4
-    CREATEGROUP,//创建群 5
-    INSERTGROUP,//加入群 6
-    GROUPCHAT,// 群聊 7
-    REMOVEUSER,//退出群 8
-    QUERYGROUP,//查看群组员 9
-    OFFLINE,//下线 10
-    ERRNO//错误 11
-};
+#include <string>
+
+// 通信协议消息类型（全链路统一使用字符串，避免 数字/字符串 混用导致 json 比较抛异常）
+const std::string REGT       = "REGT";        // 注册
+const std::string LOGTO      = "LOGTO";       // 登录
+const std::string CHAT       = "CHAT";        // 单聊
+const std::string ADDFRIEND  = "ADDFRIEND";   // 加好友
+const std::string CREATEGROUP= "CREATEGROUP";  // 创建群
+const std::string INSERTGROUP= "INSERTGROUP";  // 加入群
+const std::string GROUPCHAT  = "GROUPCHAT";   // 群聊
+const std::string REMOVEUSER = "REMOVEUSER";  // 退出群
+const std::string OFFLINE    = "OFFLINE";     // 主动下线
+const std::string ERRNO      = "ERRNO";       // 错误响应

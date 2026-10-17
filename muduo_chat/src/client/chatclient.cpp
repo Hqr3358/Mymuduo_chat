@@ -1,6 +1,7 @@
 #include "chatclient.hpp"
 #include <cerrno>
 #include <nlohmann/json.hpp>
+#include <atomic>
 #include "public.hpp"
 #include <iostream>
 #include <pthread.h>
@@ -12,9 +13,9 @@
 #include <sys/socket.h>
 #include <thread>
 using nlohmann::json;
-bool flag;//由于进程退出标志
-bool online;//服务端断开标志
-bool quit;//是否下线
+std::atomic<bool> flag{false};   // 登录成功标志（多线程读写，必须原子）
+std::atomic<bool> online{false}; // 服务端断开标志
+std::atomic<bool> quit{true};    // 是否退出登录菜单
 sem_t rwsem;
 std::string chatclient::get_time() // 获取当前时间
 {
@@ -102,19 +103,24 @@ void chatclient::recvmsg() // 子线程用于接收消息
         {
             buff[n] = '\0';
             json response;
-            response = json::parse(buff);
+            try {
+                response = json::parse(buff);
+            } catch (...) {
+                std::cerr << "bad packet: " << buff << std::endl;
+                continue;   // 半包/粘包时跳过，等下一段
+            }
             std::cout << std::endl;
-            std::cout << response.dump() << std::endl; // 显示服务端响应的内容
-            if(response["msgid"]=="LOGTO")
+            std::cout << response.dump() << std::endl;
+            if (response.value("msgid", "") == "LOGTO")
             {
                 flag = true;
-                online=true;
+                online = true;
             }
             else
             {
                 std::cout << "选择:" << std::flush;
             }
-            sem_post(&rwsem); // 通知主线程接收成功
+            sem_post(&rwsem);
         }
         else if (n == 0)
         {

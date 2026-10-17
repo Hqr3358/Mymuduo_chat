@@ -1,9 +1,11 @@
 #构建要求最小的版本
-cmake_minimum_required(VERSION 3.0)
+cmake_minimum_required(VERSION 3.10)
 #工程名
 project(chat)
 #配置编译选项
-set(CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS}-g)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -Wall")
 #配置最终可执行文件的路径
 set(EXECUTABLE_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/bin)
 #配置头文件的搜索路径

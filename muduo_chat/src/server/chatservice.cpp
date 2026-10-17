@@ -1,497 +1,397 @@
 #include "chatservice.hpp"
 #include "public.hpp"
 #include "user.hpp"
+#include "config.hpp"
 #include <muduo/base/Logging.h>
 #include <muduo/net/Callbacks.h>
 #include <mutex>
-chatservice *chatservice::init() // 返回单例
+#include <vector>
+#include <utility>
+
+chatservice *chatservice::init()
 {
     static chatservice ser;
     return &ser;
 }
-chatservice::chatservice() // 将unordered_map填充
+
+chatservice::chatservice()
 {
-    services_.insert({REGT, std::bind(&chatservice::regt, this, ::_1, ::_2, ::_3)});               // 将注册服务与对应id绑定
-    services_.insert({LOGTO, std::bind(&chatservice::logto, this, ::_1, ::_2, ::_3)});             // 将登录服务与对应id绑定
-    services_.insert({CHAT, std::bind(&chatservice::chat, this, ::_1, ::_2, ::_3)});               // 将聊天服务与对应id绑定
-    services_.insert({ADDFRIEND, std::bind(&chatservice::addfriend, this, ::_1, ::_2, ::_3)});     // 添加好友
-    services_.insert({CREATEGROUP, std::bind(&chatservice::creategroup, this, ::_1, ::_2, ::_3)}); // 创建群
-    services_.insert({INSERTGROUP, std::bind(&chatservice::addgroup, this, ::_1, ::_2, ::_3)});    // user加入群
-    services_.insert({GROUPCHAT, std::bind(&chatservice::groupchat, this, ::_1, ::_2, ::_3)});     // 群聊
-    services_.insert({OFFLINE, std::bind(&chatservice::offline, this, ::_1, ::_2, ::_3)});         // 用户下线
-    services_.insert({REMOVEUSER, std::bind(&chatservice::remove, this, ::_1, ::_2, ::_3)});       // user移除群
+    // 注册消息处理器（key 统一用字符串）
+    services_[REGT]        = std::bind(&chatservice::regt,        this, ::_1, ::_2, ::_3);
+    services_[LOGTO]        = std::bind(&chatservice::logto,       this, ::_1, ::_2, ::_3);
+    services_[CHAT]         = std::bind(&chatservice::chat,        this, ::_1, ::_2, ::_3);
+    services_[ADDFRIEND]    = std::bind(&chatservice::addfriend,    this, ::_1, ::_2, ::_3);
+    services_[CREATEGROUP]  = std::bind(&chatservice::creategroup, this, ::_1, ::_2, ::_3);
+    services_[INSERTGROUP]  = std::bind(&chatservice::addgroup,    this, ::_1, ::_2, ::_3);
+    services_[GROUPCHAT]    = std::bind(&chatservice::groupchat,   this, ::_1, ::_2, ::_3);
+    services_[OFFLINE]      = std::bind(&chatservice::offline,     this, ::_1, ::_2, ::_3);
+    services_[REMOVEUSER]    = std::bind(&chatservice::remove,     this, ::_1, ::_2, ::_3);
+
     if (redis_.connect())
     {
-        redis_.init_notify_handler(std::bind(&chatservice::redishandler, this, ::_1, ::_2)); // 初始化redis上报回调函数
+        redis_.init_notify_handler(std::bind(&chatservice::redishandler, this, ::_1, ::_2));
     }
 }
-void chatservice::clientclose(const TcpConnectionPtr &conn,int id) 
+
+bool chatservice::want_quit() { return quit_.load(); }
+
+// 连接断开（无论是客户端 FIN、主动 shutdown、还是超时踢人）统一走这里清理
+void chatservice::clientclose(const TcpConnectionPtr &conn, int id)
 {
-    User user;
     {
         std::lock_guard<std::mutex> lock(mtx_);
         idmap_.erase(conn);
-       	users_.erase(id);
+        timeout_.erase(conn);     // 修复：原来断连后 timeout_ 残留垃圾
+        if (id != 0) users_.erase(id);
     }
+    if (id != 0)
+    {
+        User user;
         user.setid(id);
-        if (user.getid() != 0)
-        {
-            user.setstate("offonline");
-            usermodel_.update(user);
-        }
-        redis_.unsubscribe(user.getid()); // 取消redis上订阅通道
+        user.setstate("offonline");
+        usermodel_.update(user);
+        redis_.unsubscribe(id);
+    }
+    std::cout << "client close, id=" << id << std::endl;
 }
-void chatservice::reset() // 服务端异常退出,将在线全变为离线
+
+void chatservice::resetstate()
 {
     usermodel_.resetstate();
 }
-void chatservice::logto(const TcpConnectionPtr &conn, json &js, Timestamp time) // 登录
+
+void chatservice::logto(const TcpConnectionPtr &conn, json &js, Timestamp)
 {
-    int id = js["id"].get<int>(); // 知道该用户在表中的id好用于登录
-    std::string passwd = js["passwd"];
-    User user = usermodel_.query(id);//在数据库表中获取该user的信息用于验证
-    // std::cout<<"-------------"<<user.getpassword()<<"------"<<passwd<<std::endl;
-    // 密码正确，登录成功
+    int id = js["id"].get<int>();
+    std::string passwd = js["passwd"].get<std::string>();
+    User user = usermodel_.query(id);
+
     if (user.getpassword() == passwd)
     {
         if (user.getstate() == "online")
         {
-            json response;
-            response["msgid"] = "ERRNO";
-            response["errno"] = -1;
-            response["msg"] = "你已经在线了";
+            json response = {{"msgid", ERRNO}, {"errno", -1}, {"msg", "你已经在线了"}};
             conn->send(response.dump());
             return;
         }
-        user.setstate("online");//设置为登录状态
+        user.setstate("online");
         {
             std::lock_guard<std::mutex> lock(mtx_);
-            users_.insert({id, conn}); // 添加到在线map和查询map里
-            idmap_.insert({conn, id});
+            users_[id] = conn;
+            idmap_[conn] = id;
+            timeout_[conn] = time(nullptr);
         }
-        usermodel_.update(user); // 更新用户状态
-        redis_.subscribe(id);// 在redis中订阅一个channel(id)
-        json response;           // 1.用户登录信息json
-        response["msgid"] = "LOGTO";
-        response["msg"] = "登录成功";
-        std::vector<std::string> friends = friend_.query(id);      // 这里得到friends表里的该用户id的全部好友id
-        std::vector<Group> groups = groupmodel_.querygroup(id);    // 这里得到userid中所有群
-        std::vector<std::string> offlinemsg = offmodel_.query(id); // 这里得到offlinemodel表里对应id的所有离线时的消息
-        if (!offlinemsg.empty())
+        usermodel_.update(user);
+        redis_.subscribe(id);
+
+        json response;
+        response["msgid"] = LOGTO;
+        response["msg"]   = "登录成功";
+
+        std::vector<std::string> friends = friend_.query(id);
+        std::vector<Group> groups = groupmodel_.querygroup(id);
+        std::vector<std::string> offmsg = offmodel_.query(id);
+
+        response["offlinemsg"] = offmsg.empty() ? json("null") : json(offmsg);
+        response["friends"]    = friends;
+
+        // 修复原 bug：vec 原来在循环内部定义，导致 groups 只保留最后一个群
+        std::vector<std::string> groupList;
+        for (auto &g : groups)
         {
-            response["offlinemsg"] = offlinemsg;
+            groupList.push_back("====id:" + std::to_string(g.getgroupid())
+                              + " name:" + g.getgroupname()
+                              + " desc:" + g.getgroupdesc() + "====");
         }
-        else
-        {
-            response["offlinemsg"] = "null";
-        }
-        if (!groups.empty())
-        {
-            for (auto &group : groups)
-            {
-                std::vector<std::string> vec;
-                std::string groupquery = "====id:" + std::to_string(group.getgroupid()) + " name:" + group.getgroupname() + " desc:" + group.getgroupdesc() + "====";
-                vec.push_back(groupquery);
-                response["groups"] = vec;
-            }
-        }
-        if (!friends.empty())
-        {
-            response["friends"] = friends;
-        }
-        conn->send(response.dump()); // 2.先发送用户登录信息
-        offmodel_.remove(id);   // 清除已看过的离线消息
+        response["groups"] = groupList;
+
+        conn->send(response.dump());
+        offmodel_.remove(id);   // 已推送的离线消息清除
     }
-    //不正确
     else
     {
-        json response;
-        response["msgid"] = "ERRNO";
-        response["errno"] = -1;
-        response["msg"] = "你的id或密码不对";
+        json response = {{"msgid", ERRNO}, {"errno", -1}, {"msg", "id 或密码错误"}};
         conn->send(response.dump());
     }
 }
-void chatservice::regt(const TcpConnectionPtr &conn, json &js, Timestamp time) // 注册
+
+void chatservice::regt(const TcpConnectionPtr &conn, json &js, Timestamp)
 {
-    std::string name = js["name"];
-    std::string passwd = js["passwd"];
+    std::string name = js["name"].get<std::string>();
+    std::string passwd = js["passwd"].get<std::string>();
     User user;
     user.setname(name);
     user.setpassword(passwd);
-    bool flag = usermodel_.insert(user); // 在注册表中插入该用户
-    if (flag)                            // 注册成功
+    if (usermodel_.insert(user))
     {
-        json response;
-        response["msgid"] = "REGT";
-        response["errno"] = 0;
-        response["id"] = user.getid();
-        response["msg"] = "注册成功";
+        json response = {{"msgid", REGT}, {"errno", 0},
+                         {"id", user.getid()}, {"msg", "注册成功"}};
         conn->send(response.dump());
     }
-    else // 注册失败
-    {
-        json response;
-        response["msgid"] = "ERRNO";
-        response["errno"] = -1;
-        response["errmsg"] = "注册失败你可能已经注册过了";
-        conn->send(response.dump());
-    }
-}
-void chatservice::chat(const TcpConnectionPtr &conn, json &js, Timestamp time) // 在线对话聊天
-{
-    int id = this->get_id(conn); // 发送方的id
-    if (id == 0)                 // 用户跳过了登录
-    {
-        json response;
-        response["msgid"] = "ERRNO";
-        response["errno"] = -1;
-        response["errmsg"] = "请先登录";
-        conn->send(response.dump());
-        return;
-    }
-    TcpConnectionPtr to_conn = nullptr;      // 接收方的connptr
-    int to_id = js["to_id"].get<int>();      // 接收方的id
-    std::string msg = js["msg"];             // 发送给接收方的消息
-    std::unique_lock<std::mutex> lock(mtx_); // 给map容器加锁
-    auto it = users_.find(to_id);   // 从用户在线表里查接收方的id
-    if (it != users_.end())
-    {
-        to_conn = it->second;
-    }
-    lock.unlock();
-    User user = usermodel_.query(to_id); // 在数据库表中获取对方id的详细信息
-    // 在自己的users在线表中判断
-    // 用户不存在或离线或在其他server上在线时
-    if (it == users_.end())
-    {
-        // 用户不存在
-        if (user.getid() == 0)
-        {
-            json response;
-            response["msgid"] = "ERRNO";
-            response["errno"] = -1;
-            response["errmsg"] = "该用户不存在";
-            conn->send(response.dump());
-        }
-        // 用户不在该server上但在其他server上在线
-        else if (user.getid() != 0 && user.getstate() == "online")
-        {
-            json result;
-            result["msgid"] = "CHAT";
-            result["to_id"] = id;
-            result["message"] = msg.c_str();
-            redis_.publish(to_id, result.dump()); // 发送给redis通道channel(to_id)
-            json response;
-            response["msgid"] = "CHAT";
-            response["message"] = "发送成功";
-            conn->send(response.dump());
-            return;
-        }
-        // 用户存在,但不在线保存消息给上线看
-        else
-        {
-            msg += "发送时间:" + js["time"].get<std::string>() + "-->to_id:" + std::to_string(id);
-            if (offmodel_.insert(to_id, msg))
-            {
-                json response;
-                response["msgid"] = "CHAT";
-                response["errno"] = 0;
-                response["message"] = "该用户不在线已为你保存消息";
-                conn->send(response.dump());
-            }
-        }
-    }
-    // 用户在该server上且在线
     else
     {
-        json result;
-        result["msgid"] = "CHAT";
-        result["to_id"] = id;
-        result["message"] = msg.c_str();
-        to_conn->send(result.dump());
-        json response;
-        response["msgid"] = "CHAT";
-        response["message"] = "发送成功";
+        json response = {{"msgid", ERRNO}, {"errno", -1},
+                         {"errmsg", "注册失败，用户名可能已存在"}};
         conn->send(response.dump());
     }
 }
-void chatservice::addfriend(const TcpConnectionPtr &conn, json &js, Timestamp time) // 添加好友
+
+void chatservice::chat(const TcpConnectionPtr &conn, json &js, Timestamp)
 {
-    int id = this->get_id(conn);
-    if (id == 0) // 用户跳过了登录
+    int from_id = get_id(conn);
+    if (from_id == 0)
     {
-        json response;
-        response["msgid"] = "ERRNO";
-        response["errno"] = -1;
-        response["errmsg"] = "请先登录";
-        conn->send(response.dump());
+        conn->send(json({{"msgid", ERRNO}, {"errno", -1}, {"errmsg", "请先登录"}}).dump());
+        return;
+    }
+    int to_id    = js["to_id"].get<int>();
+    std::string msg = js["msg"].get<std::string>();
+
+    // 锁内把 to_conn 取出来，锁外不持有锁做 DB IO
+    TcpConnectionPtr to_conn;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto it = users_.find(to_id);
+        if (it != users_.end()) to_conn = it->second;
+    }
+
+    User to_user = usermodel_.query(to_id);
+    if (to_user.getid() == 0)   // 对方根本不存在
+    {
+        conn->send(json({{"msgid", ERRNO}, {"errno", -1}, {"errmsg", "该用户不存在"}}).dump());
+        return;
+    }
+
+    if (to_conn)   // 对方在本 server 在线
+    {
+        json result = {{"msgid", CHAT}, {"from_id", from_id}, {"message", msg}};
+        to_conn->send(result.dump());
+        conn->send(json({{"msgid", CHAT}, {"message", "发送成功"}}).dump());
+    }
+    else if (to_user.getstate() == "online")   // 对方在别的 server 在线，走 redis 转发
+    {
+        json result = {{"msgid", CHAT}, {"from_id", from_id}, {"message", msg}};
+        redis_.publish(to_id, result.dump());
+        conn->send(json({{"msgid", CHAT}, {"message", "发送成功"}}).dump());
+    }
+    else   // 对方离线，存离线消息
+    {
+        std::string stored = "[" + js["time"].get<std::string>() + "] user"
+                           + std::to_string(from_id) + ": " + msg;
+        offmodel_.insert(to_id, stored);
+        conn->send(json({{"msgid", CHAT}, {"errno", 0},
+                         {"message", "对方不在线，已为你保存消息"}}).dump());
+    }
+}
+
+void chatservice::addfriend(const TcpConnectionPtr &conn, json &js, Timestamp)
+{
+    int id = get_id(conn);
+    if (id == 0)
+    {
+        conn->send(json({{"msgid", ERRNO}, {"errno", -1}, {"errmsg", "请先登录"}}).dump());
         return;
     }
     int add_id = js["add_id"].get<int>();
-    if (friend_.insert(id, add_id)) // 成功添加好友
+    if (friend_.insert(id, add_id))
     {
-        json response;
-        response["msgid"] = "ADDFRIEND";
-        std::string msg = "成功添加好友->" + std::to_string(add_id); // to_do?
-        response["message"] = msg;
-        conn->send(response.dump());
+        conn->send(json({{"msgid", ADDFRIEND},
+                         {"message", "成功添加好友->" + std::to_string(add_id)}}).dump());
     }
-    // 添加失败
     else
     {
-        json response;
-        response["msgid"] = "ERRNO";
-        response["errno"] = -1;
-        response["message"] = "添加好友失败";
-        conn->send(response.dump());
+        conn->send(json({{"msgid", ERRNO}, {"errno", -1}, {"message", "添加好友失败"}}).dump());
     }
 }
-void chatservice::creategroup(const TcpConnectionPtr &conn, json &js, Timestamp time) // 创建群
+
+void chatservice::creategroup(const TcpConnectionPtr &conn, json &js, Timestamp)
 {
-    int id = this->get_id(conn);
-    if (id == 0) // 用户跳过了登录
+    int id = get_id(conn);
+    if (id == 0)
     {
-        json response;
-        response["msgid"] = "ERRNO";
-        response["errno"] = -1;
-        response["errmsg"] = "请先登录";
-        conn->send(response.dump());
+        conn->send(json({{"msgid", ERRNO}, {"errno", -1}, {"errmsg", "请先登录"}}).dump());
         return;
     }
-    std::string name = js["name"];
-    std::string desc = js["desc"];
-    std::unique_lock<std::mutex> lock(mtx_); // 给map容器加锁
-    auto it = idmap_.find(conn);
-    lock.unlock();
-    if (it != idmap_.end())
+    Group group;
+    group.setgroupname(js["name"].get<std::string>());
+    group.setgroupdesc(js["desc"].get<std::string>());
+    if (groupmodel_.creategroup(id, group))
     {
-        int userid = it->second;
-        Group group;
-        group.setgroupname(name);
-        group.setgroupdesc(desc);
-        // 创建群成功
-        if (groupmodel_.creategroup(userid, group))
-        {
-            json response;
-            response["msgid"] = "CREATEGROUP";
-            std::string msg = "成功创建群,id->" + std::to_string(group.getgroupid());
-            response["message"] = msg.c_str();
-            conn->send(response.dump());
-            return;
-        }
+        conn->send(json({{"msgid", CREATEGROUP},
+                         {"message", "成功创建群,id->" + std::to_string(group.getgroupid())}}).dump());
     }
     else
     {
-        json response;
-        response["msgid"] = "ERRNO";
-        response["errno"] = -1;
-        response["message"] = "创建群失败";
-        conn->send(response.dump());
+        conn->send(json({{"msgid", ERRNO}, {"errno", -1}, {"message", "创建群失败"}}).dump());
     }
 }
-void chatservice::addgroup(const TcpConnectionPtr &conn, json &js, Timestamp time) // user加入群
+
+void chatservice::addgroup(const TcpConnectionPtr &conn, json &js, Timestamp)
 {
-    int id = this->get_id(conn);
-    if (id == 0) // 用户跳过了登录
+    int userid = get_id(conn);
+    if (userid == 0)
     {
-        json response;
-        response["msgid"] = "ERRNO";
-        response["errno"] = -1;
-        response["errmsg"] = "请先登录";
-        conn->send(response.dump());
+        conn->send(json({{"msgid", ERRNO}, {"errno", -1}, {"errmsg", "请先登录"}}).dump());
         return;
     }
     int groupid = js["groupid"].get<int>();
-    int userid;
-    std::unique_lock<std::mutex> lock(mtx_); // 给map容器加锁
-    auto it = idmap_.find(conn);
-    lock.unlock();
-    if (it != idmap_.end())
-    {
-        userid = it->second;
-    }
     if (groupmodel_.insertuser(groupid, userid))
     {
-        json response;
-        response["msgid"] = "INSERTGROUP";
-        std::string msg = "成功加入群,id->" + std::to_string(groupid);
-        response["message"] = msg.c_str();
-        conn->send(response.dump());
-        return;
+        conn->send(json({{"msgid", INSERTGROUP},
+                         {"message", "成功加入群,id->" + std::to_string(groupid)}}).dump());
     }
     else
     {
-        json response;
-        response["msgid"] = "ERRNO";
-        response["errno"] = -1;
-        std::string flag = "请查看自己是否已经加入过该群";
-        response["message"] = "加入群id->" + std::to_string(groupid) + "失败" + flag;
-        conn->send(response.dump());
+        conn->send(json({{"msgid", ERRNO}, {"errno", -1},
+                         {"message", "加入群" + std::to_string(groupid) + "失败，可能已加入"}}).dump());
     }
 }
-void chatservice::groupchat(const TcpConnectionPtr &conn, json &js, Timestamp time) // 群聊
+
+void chatservice::groupchat(const TcpConnectionPtr &conn, json &js, Timestamp)
 {
-    int id = this->get_id(conn);
-    if (id == 0) // 用户跳过了登录
+    int userid = get_id(conn);
+    if (userid == 0)
     {
-        json response;
-        response["msgid"] = "ERRNO";
-        response["errno"] = -1;
-        response["errmsg"] = "请先登录";
-        conn->send(response.dump());
+        conn->send(json({{"msgid", ERRNO}, {"errno", -1}, {"errmsg", "请先登录"}}).dump());
         return;
     }
-    int groupid = js["groupid"];
-    int userid = get_id(conn);
-    TcpConnectionPtr to_conn = nullptr;
-    std::vector<Groupuser> vec = groupmodel_.query(groupid, userid);//把当前userid加入的groupid中除自己外所有组员得到
-    for (auto &groupuser : vec)
+    int groupid = js["groupid"].get<int>();
+    std::string to_msg = js["msg"].get<std::string>();
+    std::string prefix = "群[" + std::to_string(groupid) + "] user"
+                       + std::to_string(userid) + ": ";
+
+    std::vector<Groupuser> members = groupmodel_.query(groupid, userid);
+    int offlineCnt = 0;
+    for (auto &m : members)
     {
-        std::unique_lock<std::mutex> lock(mtx_); // 给map容器加锁
-        auto it = users_.find(groupuser.getid());
-        lock.unlock();
-        // 发送给该server在线的群组员
-        std::string to_msg = js["msg"];
-        User user = usermodel_.query(groupuser.getid()); // 在user表中获取对方id的详细信息
-        if (it != users_.end())
+        TcpConnectionPtr to_conn;
         {
-            to_conn = it->second;
-            json result;
-            result["msgid"] = "GROUPCHAT";
-            std::string group = "群聊id:";
-            group += std::to_string(groupid) + " 群组id:";
-            std::string msg = group + std::to_string(userid) + "-->" + to_msg;
-            result["message"] = msg.c_str();
+            std::lock_guard<std::mutex> lock(mtx_);
+            auto it = users_.find(m.getid());
+            if (it != users_.end()) to_conn = it->second;
+        }
+
+        if (to_conn)    // 本 server 在线，直接发
+        {
+            json result = {{"msgid", GROUPCHAT}, {"groupid", groupid},
+                           {"from_id", userid}, {"message", prefix + to_msg}};
             to_conn->send(result.dump());
-            json response;
-            response["msgid"] = "GROUPCHAT";
-            response["message"] = "发送成功";
-            conn->send(response.dump());
         }
-        // 用户不在该server上但在线
-        else if (user.getstate() == "online")
-        {
-            json result;
-            result["msgid"] = "GROUPCHAT";
-            std::string group = "群聊id:";
-            group += std::to_string(groupid) + " 群组id:";
-            std::string msg = group + std::to_string(userid) + "-->" + to_msg;
-            result["message"] = msg.c_str();
-            redis_.publish(user.getid(), result.dump()); // 发送给redis通道channel(user.getid())
-            json response;
-            response["msgid"] = "GROUPCHAT";
-            response["message"] = "发送成功";
-            conn->send(response.dump());
-        }
-        // 群组员不在线时
         else
         {
-            std::string group = "离线消息群聊id:";
-            group += std::to_string(groupid) + "群组id:";
-            std::string msg = js["time"].get<std::string>() + group + std::to_string(userid) + "-->" + to_msg;
-            offmodel_.insert(groupuser.getid(), msg);
-            json response;
-            response["msg"] = "已发送给了离线群组员";
-            conn->send(response.dump());
+            User u = usermodel_.query(m.getid());
+            if (u.getstate() == "online")   // 别的 server 在线，redis 转发
+            {
+                json result = {{"msgid", GROUPCHAT}, {"groupid", groupid},
+                               {"from_id", userid}, {"message", prefix + to_msg}};
+                redis_.publish(m.getid(), result.dump());
+            }
+            else   // 离线，存离线消息
+            {
+                std::string stored = "[" + js["time"].get<std::string>() + "] " + prefix + to_msg;
+                offmodel_.insert(m.getid(), stored);
+                ++offlineCnt;
+            }
         }
     }
+    // 修复原 bug：原来循环内每个组员都给发送方回一次"发送成功"，N 个组员回 N 次
+    json resp = {{"msgid", GROUPCHAT}, {"message", "群消息已分发"}};
+    if (offlineCnt > 0) resp["offline"] = offlineCnt;
+    conn->send(resp.dump());
 }
-void chatservice::offline(const TcpConnectionPtr &conn, json &js, Timestamp time) // 用户下线
+
+void chatservice::offline(const TcpConnectionPtr &conn, json &, Timestamp)
 {
     int id = get_id(conn);
-    usermodel_.offline(id);
-    redis_.unsubscribe(id);
-    if(conn->connected()) conn->shutdown();
+    clientclose(conn, id);   // 复用统一清理：map/DB/redis 一次搞干净
+    if (conn->connected()) conn->shutdown();
 }
-void chatservice::remove(const TcpConnectionPtr &conn, json &js, Timestamp time) // user移出群
+
+void chatservice::remove(const TcpConnectionPtr &conn, json &js, Timestamp)
 {
-    int id = this->get_id(conn);
-    if (id == 0) // 用户跳过了登录
+    int userid = get_id(conn);
+    if (userid == 0)
     {
-        json response;
-        response["msgid"] = "ERRNO";
-        response["errno"] = -1;
-        response["errmsg"] = "请先登录";
-        conn->send(response.dump());
+        conn->send(json({{"msgid", ERRNO}, {"errno", -1}, {"errmsg", "请先登录"}}).dump());
         return;
     }
-    int groupid = js["removegroupid"];
-    int userid;
-    std::unique_lock<std::mutex> lock(mtx_); // 给map容器加锁
-    auto it = idmap_.find(conn);
-    lock.unlock();
-    if (it != idmap_.end())
-    {
-        userid = it->second;
-    }
+    int groupid = js["removegroupid"].get<int>();
     groupmodel_.remove(groupid, userid);
-    json response;
-    response["msgid"] = "REMOVEUSER";
-    std::string msg = "成功退出群,id->" + std::to_string(groupid);
-    response["message"] = msg.c_str();
-    conn->send(response.dump());
+    conn->send(json({{"msgid", REMOVEUSER},
+                     {"message", "成功退出群,id->" + std::to_string(groupid)}}).dump());
 }
-fun chatservice::headlrback(int msgid) // 返回对应的执行函数
+
+fun chatservice::headlrback(const std::string &msgid)
 {
     auto it = services_.find(msgid);
     if (it == services_.end())
     {
         return [=](const TcpConnectionPtr &, json &js, Timestamp)
         {
-            LOG_ERROR << "services not find msgid:" << msgid;
+            LOG_ERROR << "unknown msgid: " << msgid;
         };
     }
-    return services_[msgid];
+    return it->second;
 }
+
 void chatservice::updateActiveTime(const TcpConnectionPtr &conn)
 {
-    timeout_[conn]=time(nullptr);//若没创建直接创建并更新conn时间（只负责保存conn活跃时间）
+    std::lock_guard<std::mutex> lock(mtx_);
+    timeout_[conn] = time(nullptr);
 }
+
 void chatservice::checkTimeout()
 {
-    time_t now=time(nullptr);
-    for(auto it=timeout_.begin();it!=timeout_.end();)
-   	{
-        if(now-it->second>30)
-        {
-            //保留一个ptr计数让后面的clientclose能够调用
-            TcpConnectionPtr conn=it->first;
-            int id=idmap_[it->first];
-            it=timeout_.erase(it);
-            conn->shutdown();	
-        }
-        else
-        {
-            it++;
-        }
-    }
-    
-}
-void chatservice::redishandler(int channel, std::string msg) // redis上报回调函数
-{
-    std::unique_lock<std::mutex> lock(mtx_); // 给map容器加锁
-    auto it = users_.find(channel);
-    lock.unlock();
-    if (it != users_.end())
+    time_t now = time(nullptr);
+    int timeout = Config::instance().idle_timeout_sec;
+    // 锁内一次性收集要踢的连接，锁外再 shutdown（避免在锁内做 close 回调）
+    std::vector<std::pair<TcpConnectionPtr,int>> dead;
     {
-        json response;
-        response = json::parse(msg.c_str());
-        it->second->send(response.dump());
-        return;
+        std::lock_guard<std::mutex> lock(mtx_);
+        for (auto it = timeout_.begin(); it != timeout_.end();)
+        {
+            if (now - it->second > timeout)
+            {
+                int id = 0;
+                auto idIt = idmap_.find(it->first);
+                if (idIt != idmap_.end()) id = idIt->second;
+                dead.push_back({it->first, id});
+                it = timeout_.erase(it);
+            }
+            else ++it;
+        }
     }
-    // 用户突然离线时
-    offmodel_.insert(channel, msg);
+    for (auto &[conn, id] : dead)
+    {
+        // conn->shutdown 会触发 onConnectionCallback -> clientclose，那里会再清理一次
+        if (conn->connected()) conn->shutdown();
+    }
 }
-int chatservice::get_id(const TcpConnectionPtr &conn) // 获取当前是那个用户id连接该tcp
+
+// redis 订阅线程收到跨机消息：必须投递到 conn 所属 loop 线程里再 send（muduo 线程安全要求）
+void chatservice::redishandler(int channel, std::string msg)
 {
-    std::unique_lock<std::mutex> lock(mtx_); // 给map容器加锁
-    //可优化
+    TcpConnectionPtr conn;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto it = users_.find(channel);
+        if (it != users_.end()) conn = it->second;
+    }
+    if (conn)
+    {
+        conn->getLoop()->runInLoop([conn, msg]() {   // 投递到 conn 所在 loop
+            conn->send(msg);
+        });
+    }
+    else
+    {
+        offmodel_.insert(channel, msg);   // 用户刚好离线，落离线表
+    }
+}
+
+int chatservice::get_id(const TcpConnectionPtr &conn)
+{
+    std::lock_guard<std::mutex> lock(mtx_);
     auto it = idmap_.find(conn);
-    lock.unlock();
-    if (it != idmap_.end())
-    {
-        return it->second;
-    }
-    return 0;
+    return it != idmap_.end() ? it->second : 0;
 }

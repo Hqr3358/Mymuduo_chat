@@ -1,13 +1,14 @@
 #pragma once
-#include"mysql.hpp"
-#include<vector>
-class Offmodel//对用户保存的消息进行管理
-{   
+#include "mysql.hpp"
+#include <vector>
+#include <string>
+
+class Offmodel // 离线消息表管理
+{
 public:
-    bool insert(int id,std::string& msg);//将离线消息保存在表中的对应id用户上
-    std::vector<std::string> query(int id);//将保存的消息显示给该id用户
-    void remove(int id);//清除已看过的离线消息
+    bool insert(int id, const std::string& msg); // 存离线消息
+    std::vector<std::string> query(int id);       // 拉全部离线消息
+    void remove(int id);                          // 清空已读
 private:
     MYSQL_RES *res_;
-   // std::string msg_;
 };
