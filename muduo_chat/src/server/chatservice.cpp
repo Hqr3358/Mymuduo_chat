@@ -7,6 +7,7 @@
 #include <mutex>
 #include <vector>
 #include <utility>
+#include <iostream>
 
 chatservice *chatservice::init()
 {
