@@ -6,25 +6,23 @@
 #include <string>
 #include "config.hpp"
 
-// MySQL 连接池：预先建立 N 个长连接，业务侧借/还，避免每条消息短连接握手
+/**
+ * @brief MySQL 连接池单例
+ * @details 启动时预建 N 条长连接，业务侧 borrow/return，
+ *          避免每条消息都短连接握手；get() 时用 mysql_ping 探活，断了自动重连
+ */
 class MySQLConnPool
 {
 public:
     static MySQLConnPool& instance();
-
-    // 取一个连接（池空则阻塞等待）
-    MYSQL* get();
-    // 归还连接
-    void release(MYSQL* conn);
+    MYSQL* get();                 // 取一条连接（池空阻塞等待）
+    void release(MYSQL* conn);    // 归还连接
     ~MySQLConnPool();
 
 private:
     MySQLConnPool();
     MySQLConnPool(const MySQLConnPool&) = delete;
     MySQLConnPool& operator=(const MySQLConnPool&) = delete;
-
-    void produce();   // 启动后台线程补充连接（这里简化：启动时一次性建好）
-    void close();
 
     std::queue<MYSQL*> connQueue_;
     std::mutex mtx_;

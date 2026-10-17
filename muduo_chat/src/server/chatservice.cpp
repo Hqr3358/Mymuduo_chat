@@ -9,24 +9,26 @@
 #include <utility>
 #include <iostream>
 
+/** @brief 返回业务单例 */
 chatservice *chatservice::init()
 {
     static chatservice ser;
     return &ser;
 }
 
+/** @brief 构造函数：注册所有消息处理器，并连接 redis、注册跨机消息回调 */
 chatservice::chatservice()
 {
-    // 注册消息处理器（key 统一用字符串）
+    // 优化：msgid 统一用字符串做 key，避免数字/字符串混用导致客户端 json 比较抛异常
     services_[REGT]        = std::bind(&chatservice::regt,        this, ::_1, ::_2, ::_3);
-    services_[LOGTO]        = std::bind(&chatservice::logto,       this, ::_1, ::_2, ::_3);
-    services_[CHAT]         = std::bind(&chatservice::chat,        this, ::_1, ::_2, ::_3);
-    services_[ADDFRIEND]    = std::bind(&chatservice::addfriend,    this, ::_1, ::_2, ::_3);
-    services_[CREATEGROUP]  = std::bind(&chatservice::creategroup, this, ::_1, ::_2, ::_3);
-    services_[INSERTGROUP]  = std::bind(&chatservice::addgroup,    this, ::_1, ::_2, ::_3);
-    services_[GROUPCHAT]    = std::bind(&chatservice::groupchat,   this, ::_1, ::_2, ::_3);
-    services_[OFFLINE]      = std::bind(&chatservice::offline,     this, ::_1, ::_2, ::_3);
-    services_[REMOVEUSER]    = std::bind(&chatservice::remove,     this, ::_1, ::_2, ::_3);
+    services_[LOGTO]       = std::bind(&chatservice::logto,       this, ::_1, ::_2, ::_3);
+    services_[CHAT]        = std::bind(&chatservice::chat,        this, ::_1, ::_2, ::_3);
+    services_[ADDFRIEND]   = std::bind(&chatservice::addfriend,   this, ::_1, ::_2, ::_3);
+    services_[CREATEGROUP] = std::bind(&chatservice::creategroup, this, ::_1, ::_2, ::_3);
+    services_[INSERTGROUP] = std::bind(&chatservice::addgroup,    this, ::_1, ::_2, ::_3);
+    services_[GROUPCHAT]   = std::bind(&chatservice::groupchat,  this, ::_1, ::_2, ::_3);
+    services_[OFFLINE]     = std::bind(&chatservice::offline,     this, ::_1, ::_2, ::_3);
+    services_[REMOVEUSER]  = std::bind(&chatservice::remove,      this, ::_1, ::_2, ::_3);
 
     if (redis_.connect())
     {
@@ -34,15 +36,17 @@ chatservice::chatservice()
     }
 }
 
+/** @brief 供 main 线程周期轮询是否收到退出信号 */
 bool chatservice::want_quit() { return quit_.load(); }
 
-// 连接断开（无论是客户端 FIN、主动 shutdown、还是超时踢人）统一走这里清理
+/** @brief 连接断开统一清理：踢 map、落 DB、退 redis 订阅 */
 void chatservice::clientclose(const TcpConnectionPtr &conn, int id)
 {
     {
         std::lock_guard<std::mutex> lock(mtx_);
         idmap_.erase(conn);
-        timeout_.erase(conn);     // 修复：原来断连后 timeout_ 残留垃圾
+        // 优化：原来断连后 timeout_ 残留垃圾，这里一并清掉
+        timeout_.erase(conn);
         if (id != 0) users_.erase(id);
     }
     if (id != 0)
@@ -56,11 +60,13 @@ void chatservice::clientclose(const TcpConnectionPtr &conn, int id)
     std::cout << "client close, id=" << id << std::endl;
 }
 
+/** @brief 进程退出时把所有 online 用户批量置为 offline */
 void chatservice::resetstate()
 {
     usermodel_.resetstate();
 }
 
+/** @brief 登录：校验密码、上线、订阅 redis、拉好友/群/离线消息一次性返回 */
 void chatservice::logto(const TcpConnectionPtr &conn, json &js, Timestamp)
 {
     int id = js["id"].get<int>();
@@ -96,7 +102,7 @@ void chatservice::logto(const TcpConnectionPtr &conn, json &js, Timestamp)
         response["offlinemsg"] = offmsg.empty() ? json("null") : json(offmsg);
         response["friends"]    = friends;
 
-        // 修复原 bug：vec 原来在循环内部定义，导致 groups 只保留最后一个群
+        // 优化：原来 vec 在 for 循环内部定义，导致 groups 只保留最后一个群
         std::vector<std::string> groupList;
         for (auto &g : groups)
         {
@@ -116,6 +122,7 @@ void chatservice::logto(const TcpConnectionPtr &conn, json &js, Timestamp)
     }
 }
 
+/** @brief 注册：往 user 表插一条记录，成功回新生成的 id */
 void chatservice::regt(const TcpConnectionPtr &conn, json &js, Timestamp)
 {
     std::string name = js["name"].get<std::string>();
@@ -137,6 +144,7 @@ void chatservice::regt(const TcpConnectionPtr &conn, json &js, Timestamp)
     }
 }
 
+/** @brief 单聊：本 server 在线直接发，跨 server 走 redis，离线落离线表 */
 void chatservice::chat(const TcpConnectionPtr &conn, json &js, Timestamp)
 {
     int from_id = get_id(conn);
@@ -148,7 +156,7 @@ void chatservice::chat(const TcpConnectionPtr &conn, json &js, Timestamp)
     int to_id    = js["to_id"].get<int>();
     std::string msg = js["msg"].get<std::string>();
 
-    // 锁内把 to_conn 取出来，锁外不持有锁做 DB IO
+    // 优化：锁内只取 to_conn，锁外做 DB 查询，缩短临界区
     TcpConnectionPtr to_conn;
     {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -169,7 +177,7 @@ void chatservice::chat(const TcpConnectionPtr &conn, json &js, Timestamp)
         to_conn->send(result.dump());
         conn->send(json({{"msgid", CHAT}, {"message", "发送成功"}}).dump());
     }
-    else if (to_user.getstate() == "online")   // 对方在别的 server 在线，走 redis 转发
+    else if (to_user.getstate() == "online")   // 优化：对方在别的 server 在线，走 redis 发布跨机路由
     {
         json result = {{"msgid", CHAT}, {"from_id", from_id}, {"message", msg}};
         redis_.publish(to_id, result.dump());
@@ -185,6 +193,7 @@ void chatservice::chat(const TcpConnectionPtr &conn, json &js, Timestamp)
     }
 }
 
+/** @brief 添加好友：双向写 friends 表 */
 void chatservice::addfriend(const TcpConnectionPtr &conn, json &js, Timestamp)
 {
     int id = get_id(conn);
@@ -205,6 +214,7 @@ void chatservice::addfriend(const TcpConnectionPtr &conn, json &js, Timestamp)
     }
 }
 
+/** @brief 创建群：建 allgroup 记录 + 把创建者设为群主 */
 void chatservice::creategroup(const TcpConnectionPtr &conn, json &js, Timestamp)
 {
     int id = get_id(conn);
@@ -227,6 +237,7 @@ void chatservice::creategroup(const TcpConnectionPtr &conn, json &js, Timestamp)
     }
 }
 
+/** @brief 加入指定群 */
 void chatservice::addgroup(const TcpConnectionPtr &conn, json &js, Timestamp)
 {
     int userid = get_id(conn);
@@ -248,6 +259,7 @@ void chatservice::addgroup(const TcpConnectionPtr &conn, json &js, Timestamp)
     }
 }
 
+/** @brief 群聊：遍历群成员，按在线状态分三路：本地直连 / redis 跨机 / 离线落库 */
 void chatservice::groupchat(const TcpConnectionPtr &conn, json &js, Timestamp)
 {
     int userid = get_id(conn);
@@ -281,7 +293,7 @@ void chatservice::groupchat(const TcpConnectionPtr &conn, json &js, Timestamp)
         else
         {
             User u = usermodel_.query(m.getid());
-            if (u.getstate() == "online")   // 别的 server 在线，redis 转发
+            if (u.getstate() == "online")   // 优化：别的 server 在线，redis 发布跨机路由
             {
                 json result = {{"msgid", GROUPCHAT}, {"groupid", groupid},
                                {"from_id", userid}, {"message", prefix + to_msg}};
@@ -295,19 +307,22 @@ void chatservice::groupchat(const TcpConnectionPtr &conn, json &js, Timestamp)
             }
         }
     }
-    // 修复原 bug：原来循环内每个组员都给发送方回一次"发送成功"，N 个组员回 N 次
+    // 优化：原来循环内每个组员都给发送方回一次"发送成功"，N 个组员回 N 次，改为统一回一次
     json resp = {{"msgid", GROUPCHAT}, {"message", "群消息已分发"}};
     if (offlineCnt > 0) resp["offline"] = offlineCnt;
     conn->send(resp.dump());
 }
 
+/** @brief 主动下线：复用 clientclose 统一清理后 shutdown */
 void chatservice::offline(const TcpConnectionPtr &conn, json &, Timestamp)
 {
     int id = get_id(conn);
-    clientclose(conn, id);   // 复用统一清理：map/DB/redis 一次搞干净
+    // 优化：原来 offline 只改 DB 不清 users_/idmap_，导致后续消息丢失，这里复用统一清理
+    clientclose(conn, id);
     if (conn->connected()) conn->shutdown();
 }
 
+/** @brief 退出指定群 */
 void chatservice::remove(const TcpConnectionPtr &conn, json &js, Timestamp)
 {
     int userid = get_id(conn);
@@ -322,6 +337,7 @@ void chatservice::remove(const TcpConnectionPtr &conn, json &js, Timestamp)
                      {"message", "成功退出群,id->" + std::to_string(groupid)}}).dump());
 }
 
+/** @brief 根据 msgid 从 services_ 表查对应业务函数，查不到返回空 lambda */
 fun chatservice::headlrback(const std::string &msgid)
 {
     auto it = services_.find(msgid);
@@ -335,17 +351,19 @@ fun chatservice::headlrback(const std::string &msgid)
     return it->second;
 }
 
+/** @brief 收到任何业务包都刷新一次该 conn 的活跃时间 */
 void chatservice::updateActiveTime(const TcpConnectionPtr &conn)
 {
     std::lock_guard<std::mutex> lock(mtx_);
     timeout_[conn] = time(nullptr);
 }
 
+/** @brief 周期任务：扫 timeout_，超过 30s 没动静的连接踢掉 */
 void chatservice::checkTimeout()
 {
     time_t now = time(nullptr);
     int timeout = Config::instance().idle_timeout_sec;
-    // 锁内一次性收集要踢的连接，锁外再 shutdown（避免在锁内做 close 回调）
+    // 优化：锁内一次性收集要踢的连接，锁外再 shutdown，避免持锁做 close 回调；同时用 find 不用 operator[]，避免污染 map
     std::vector<std::pair<TcpConnectionPtr,int>> dead;
     {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -364,12 +382,12 @@ void chatservice::checkTimeout()
     }
     for (auto &[conn, id] : dead)
     {
-        // conn->shutdown 会触发 onConnectionCallback -> clientclose，那里会再清理一次
+        // conn->shutdown 会触发 onConnectionCallback -> clientclose，那里会再做一次幂等清理
         if (conn->connected()) conn->shutdown();
     }
 }
 
-// redis 订阅线程收到跨机消息：必须投递到 conn 所属 loop 线程里再 send（muduo 线程安全要求）
+/** @brief redis 订阅线程收到跨机消息的回调：投递到 conn 所属 loop 线程再 send */
 void chatservice::redishandler(int channel, std::string msg)
 {
     TcpConnectionPtr conn;
@@ -380,7 +398,8 @@ void chatservice::redishandler(int channel, std::string msg)
     }
     if (conn)
     {
-        conn->getLoop()->runInLoop([conn, msg]() {   // 投递到 conn 所在 loop
+        // 优化：muduo 要求 send 必须在 conn 所属 loop 线程调用，这里用 runInLoop 投递，避免跨线程数据竞争
+        conn->getLoop()->runInLoop([conn, msg]() {
             conn->send(msg);
         });
     }
@@ -390,6 +409,7 @@ void chatservice::redishandler(int channel, std::string msg)
     }
 }
 
+/** @brief 通过 conn 反查 userid，未登录返回 0 */
 int chatservice::get_id(const TcpConnectionPtr &conn)
 {
     std::lock_guard<std::mutex> lock(mtx_);
