@@ -1,6 +1,6 @@
 #include "user.hpp"
 #include <time.h>
-User::User() : id_(0), name_(" "), ps_(" "), state_(" "),ti_(time(nullptr))
+User::User() : id_(0), name_(" "), state_(" "), ps_(" "), ti_(time(nullptr))
 {
 }
 void User::setid(int id)
