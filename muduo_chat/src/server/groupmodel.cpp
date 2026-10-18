@@ -1,4 +1,5 @@
 #include "groupmodel.hpp"
+#include "mysql.hpp"
 
 bool Groupmodel::creategroup(int userid, Group &group) // 创建群：插 allgroup + 把创建者设为群主
 {

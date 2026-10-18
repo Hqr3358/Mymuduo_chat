@@ -1,4 +1,5 @@
 #include "usermodel.hpp"
+#include "mysql.hpp"
 #include <string>
 
 UserModel::UserModel() {}

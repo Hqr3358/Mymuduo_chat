@@ -1,7 +1,8 @@
 #pragma once
-#include "mysql.hpp"
 #include <vector>
 #include <string>
+
+struct MYSQL_RES;   // 前向声明，mysql.hpp 只在 .cc 里 include
 
 class Offmodel // 离线消息表管理
 {

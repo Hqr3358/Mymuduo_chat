@@ -1,4 +1,5 @@
 #include "offlineusermodel.hpp"
+#include "mysql.hpp"
 
 bool Offmodel::insert(int id, const std::string& msg) // 保存离线消息
 {
